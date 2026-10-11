@@ -13,6 +13,15 @@ env/
 
 # Environment variables / secrets
 .env
+*.env
+key.env
+
+# Script PDF e testo estratto
+*.pdf
+script_estratto.txt
+
+# Cache delle analisi Gemini
+.cache_analisi/
 
 # IDE
 .vscode/

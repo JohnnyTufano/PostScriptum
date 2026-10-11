@@ -1,47 +1,55 @@
+import argparse
 import os
-import json
-from google import genai
+import sys
+from pathlib import Path
 
-# Importiamo dal nostro modulo ai_service
-from aiService import dividi_script_in_scene, analizza_scena_con_ai
-from models import Sceneggiatura
+from dotenv import load_dotenv
+from google import genai
+from pypdf import PdfReader
+
+import aiService
+
+
+def leggi_script(percorso: str) -> str:
+    p = Path(percorso)
+    if p.suffix.lower() == ".pdf":
+        reader = PdfReader(str(p))
+        return "\n".join(pagina.extract_text() or "" for pagina in reader.pages)
+    return p.read_text(encoding="utf-8")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Spoglio automatico di una sceneggiatura con Gemini")
+    ap.add_argument("script", help="File di testo dello script (.txt)")
+    ap.add_argument("-o", "--output", default="analisi.json")
+    ap.add_argument("--scene-per-blocco", type=int, default=15)
+    args = ap.parse_args()
+
+    if Path("key.env").exists():
+        load_dotenv("key.env")
+
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        sys.exit("❌ GEMINI_API_KEY mancante in key.env o nelle variabili d'ambiente.")
+
+    testo = leggi_script(args.script)
+    if not testo.strip():
+        sys.exit("❌ Nessun testo estratto: il PDF potrebbe essere una scansione (immagini).")
+    print(f"📄 Estratti {len(testo)} caratteri dallo script.")
+    Path("script_estratto.txt").write_text(testo, encoding="utf-8")  # per controllare l'estrazione
+    client = genai.Client(api_key=api_key)
+
+    try:
+        risultato = aiService.analizza_script(client, testo, max_scene=args.scene_per_blocco)
+    except aiService.QuotaGiornalieraEsaurita:
+        sys.exit(1)
+    except Exception as e:
+        sys.exit(f"💥 Errore: {e}")
+
+    Path(args.output).write_text(risultato.model_dump_json(indent=2), encoding="utf-8")
+    print(f"\n🎉 Fatto: {len(risultato.scene)} scene, {len(risultato.personaggi)} personaggi, "
+          f"{len(risultato.locations)} location → {args.output}")
+
 
 if __name__ == "__main__":
-    # 1. Inizializzazione Client Gemini (cerca la variabile d'ambiente GEMINI_API_KEY)
-    # Oppure puoi passare la chiave diretta: genai.Client(api_key="TUA_API_KEY")
-    client = genai.Client()
-
-    # 2. Sceneggiatura di prova
-    script_test = """
-    INT. RISTORANTE - NOTTE
-    Marco indossa una giacca di pelle nera. Siede al tavolo maneggiando un vecchio orologio d'oro.
-    Giulia entra correndo, indossando un impermeabile rosso. Appoggia una pistola d'argento sul tavolo.
-
-    EST. STRADA - NOTTE
-    Giulia corre sotto la pioggia impugnando la pistola d'argento.
-    """
-
-    print("--- Avvio divisione scene ---")
-    scene_estratte = dividi_script_in_scene(script_test)
-    print(f"Trovate {len(scene_estratte)} scene.\n")
-
-    lista_scene_elaborate = []
-
-    # 3. Analisi di ogni scena tramite IA
-    for i, testo_scena in enumerate(scene_estratte, start=1):
-        print(f"Elaborazione Scena {i} con l'IA...")
-        scena_obj = analizza_scena_con_ai(client, testo_scena, numero_scena=i)
-        lista_scene_elaborate.append(scena_obj)
-
-    # 4. Creazione dell'oggetto globale Sceneggiatura
-    sceneggiatura_finale = Sceneggiatura(
-        titolo="Film di Prova",
-        descrizione="Script di test per il breakdown",
-        scene=lista_scene_elaborate
-    )
-
-    # 5. Salvataggio su file JSON
-    with open("output_breakdown.json", "w", encoding="utf-8") as f:
-        json.dump(sceneggiatura_finale.model_dump(), f, indent=4, ensure_ascii=False)
-
-    print("\n✅ Breakdown completato con successo! Il file 'output_breakdown.json' è stato generato.")
+    main()
