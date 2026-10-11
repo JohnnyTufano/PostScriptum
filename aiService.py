@@ -30,6 +30,10 @@ class QuotaGiornalieraEsaurita(RuntimeError):
     pass
 
 
+class ModelloSovraccarico(RuntimeError):
+    pass
+
+
 # ---------------------------------------------------------------- split & pack
 RE_SCENA = re.compile(
     r"^\s*(?:\d+[A-Z]?\s*[\.\)\-–—:]*\s*)?"
@@ -51,19 +55,34 @@ def _spezza_lunga(testo: str, max_char: int) -> list[str]:
     return pezzi
 
 
-def dividi_in_scene(testo: str) -> list[str]:
+RE_RUMORE = re.compile(
+    r"^\s*(?:\(CONTINUED\)|CONTINUED:\s*\d*\.?|\(MORE\)(?:\s*\(CONTINUED\))?|\d{1,3}\.)\s*$",
+    re.IGNORECASE,
+)
+
+
+def pulisci_testo(testo: str) -> str:
+    """Toglie il rumore da PDF: (CONTINUED), CONTINUED: 7., (MORE), numeri di pagina."""
+    righe = [r for r in testo.splitlines() if not RE_RUMORE.match(r)]
+    return "\n".join(righe)
+
+
+def dividi_in_scene(testo: str, max_scena=60_000) -> list[str]:
     """Divide lo script in scene localmente (0 richieste API)."""
     inizi = [m.start() for m in RE_SCENA.finditer(testo)]
-    if not inizi:  # nessuna intestazione riconosciuta: fallback a paragrafi
+    if not inizi:  # nessuna intestazione riconosciuta: fallback a pezzi
         print("⚠️  Nessuna intestazione di scena riconosciuta: divido il testo a pezzi.")
         return _spezza_lunga(testo, 8_000)
-    if inizi[0] > 0:
-        inizi.insert(0, 0)
+
+    # il frontespizio prima della scena 1 viene unito alla scena 1 (non e' una scena)
+    inizi[0] = 0
     inizi.append(len(testo))
     scene = [testo[a:b].strip() for a, b in zip(inizi, inizi[1:]) if testo[a:b].strip()]
+
     out = []
     for sc in scene:
-        out.extend(_spezza_lunga(sc, 15_000) if len(sc) > 15_000 else [sc])
+        # una scena si spezza solo se e' davvero enorme
+        out.extend(_spezza_lunga(sc, max_scena) if len(sc) > max_scena else [sc])
     return out
 
 
@@ -109,7 +128,7 @@ def _modelli_disponibili(client) -> str:
         return f"  (impossibile ottenere l'elenco: {ex})"
 
 
-def chiama_gemini(client, prompt: str, max_retries=5) -> AnalisiBlocco:
+def _chiama(client, prompt: str, modello: str, max_retries=5) -> AnalisiBlocco:
     config = types.GenerateContentConfig(
         system_instruction=ISTRUZIONI,
         response_mime_type="application/json",
@@ -120,7 +139,7 @@ def chiama_gemini(client, prompt: str, max_retries=5) -> AnalisiBlocco:
     for tentativo in range(1, max_retries + 1):
         _rispetta_rpm()
         try:
-            resp = client.models.generate_content(model=NOME_MODELLO, contents=prompt, config=config)
+            resp = client.models.generate_content(model=modello, contents=prompt, config=config)
             if resp.parsed is not None:
                 return resp.parsed
             return AnalisiBlocco.model_validate_json(resp.text)
@@ -147,7 +166,19 @@ def chiama_gemini(client, prompt: str, max_retries=5) -> AnalisiBlocco:
             time.sleep(s)
         except ValueError as e:  # JSON non valido
             print(f"⚠️  Risposta non valida ({e}), riprovo")
-    raise RuntimeError("Tentativi esauriti.")
+    raise ModelloSovraccarico(f"Il modello {modello} e' sovraccarico o non risponde.")
+
+
+def chiama_gemini(client, prompt: str) -> AnalisiBlocco:
+    """Prova il modello principale; se e' sovraccarico usa quello di riserva (se impostato)."""
+    try:
+        return _chiama(client, prompt, NOME_MODELLO)
+    except ModelloSovraccarico as e:
+        riserva = os.getenv("GEMINI_FALLBACK_MODEL", "").strip()
+        if not riserva or riserva == NOME_MODELLO:
+            raise
+        print(f"🔁 {e} Provo il modello di riserva: {riserva}")
+        return _chiama(client, prompt, riserva)
 
 
 # ---------------------------------------------------------------- cache
@@ -214,6 +245,7 @@ def unisci_risultati(blocchi: list[AnalisiBlocco], titolo="") -> Sceneggiatura:
 
 # ---------------------------------------------------------------- entry point
 def analizza_script(client, testo_script: str, max_scene=15, max_char=40_000) -> Sceneggiatura:
+    testo_script = pulisci_testo(testo_script)
     scene = dividi_in_scene(testo_script)
     blocchi = raggruppa_in_blocchi(scene, max_scene, max_char)
     print(f"📋 {len(scene)} scene → {len(blocchi)} richieste API (max).")
